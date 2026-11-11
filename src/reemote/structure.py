@@ -6,10 +6,12 @@ A stand-alone demonstration of the design patterns used in
 ``reemote/execute.py``.
 
 The SSH / inventory machinery is intentionally *not* implemented.  "Remote
-command execution" is simulated in-process, so this module has no third-party
-dependencies.  The engine (Context, Shell/Callback/Sequence, traversal,
-Blackboard, lockstep orchestration and the ``execute()`` facade) lives here;
-the demonstration command tree (``demo_script`` and its factories) lives in
+command execution" is delegated to ``reemote.simulation``, which simulates each
+command in-process (dispatching ``uname`` / ``echo`` / ``apt`` / ... to
+per-program handlers), so this module has no third-party dependencies.  The
+engine (Context, Shell/Callback/Sequence, traversal, Blackboard, lockstep
+orchestration and the ``execute()`` facade) lives here; the demonstration
+command tree (``demo_script`` and its factories) lives in
 ``tests/test_structure.py``.
 
 Pattern map (demo -> counterpart in reemote/execute.py):
@@ -44,6 +46,8 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, AsyncGenerator, Callable, List, Tuple
 
+from reemote.simulation import CompletedProcess, run_command, reset
+
 
 # ---------------------------------------------------------------------------
 # Custom exception for Callback-initiated aborts
@@ -69,7 +73,7 @@ class CallbackAbortError(Exception):
         )
 
 # ---------------------------------------------------------------------------
-# Simulated stand-ins for reemote.inventory / asyncssh
+# Simulated stand-in for reemote.inventory
 # ---------------------------------------------------------------------------
 
 
@@ -83,15 +87,9 @@ class SimulatedHost:
     latency: float = 0.05
 
 
-@dataclass
-class CompletedProcess:
-    """Stand-in for ``asyncssh.SSHCompletedProcess``."""
-
-    command: str
-    exit_status: int
-    returncode: int
-    stdout: str
-    stderr: str
+# ``CompletedProcess`` -- the ``asyncssh.SSHCompletedProcess`` stand-in -- now
+# lives in ``reemote.simulation`` (which produces it); the ADAPTER below
+# converts one into the plain dict the rest of the framework expects.
 
 
 def completed_process_to_dict(cp: CompletedProcess) -> dict:
@@ -219,11 +217,14 @@ def get_result(context: Context) -> Any:
 async def run_operation(context: Context) -> Any | None:
     """The "remote command" runner.
 
-    In reemote this opens an SSH connection (with sudo/su handling); here the
-    execution is simulated in-process.  Errors (SSH failures, non-zero return
-    codes) are CAUGHT and RECORDED as error results, not propagated -- this
-    matches the real framework's "catch and record" pattern, where one host's
-    failure doesn't crash the run for other hosts.
+    In reemote this opens an SSH connection (with sudo/su handling) and runs
+    the command; here execution is delegated to ``reemote.simulation``, which
+    dispatches the command to a per-program handler (``uname``, ``echo``,
+    ``apt``, ``apt-get``, ...) and returns a simulated ``CompletedProcess``.
+    Errors (SSH failures, non-zero return codes) are CAUGHT and RECORDED as
+    error results, not propagated -- this matches the real framework's "catch
+    and record" pattern, where one host's failure doesn't crash the run for
+    other hosts.
     """
     if not group_matches(context):
         return None
@@ -231,21 +232,11 @@ async def run_operation(context: Context) -> Any | None:
     await asyncio.sleep(context.inventory_item.latency)  # simulated latency
 
     try:
-        # Simulate SSH errors for specific commands (demonstration)
-        if context.command == "ssh-error":
-            raise RuntimeError("Simulated SSH connection error")
-
-        # Simulate the command execution
-        if "fail" in context.command:  # simulate a non-zero exit status
-            cp = CompletedProcess(context.command, 1, 1, "", "simulated failure")
-        else:
-            cp = CompletedProcess(
-                command=context.command,
-                exit_status=0,
-                returncode=0,
-                stdout=f"[{context.inventory_item.name}] output of: {context.command}",
-                stderr="",
-            )
+        # SIMULATION: turn the described command into a real (simulated)
+        # CompletedProcess via the per-program handler registry in
+        # reemote.simulation.  Raises for the "ssh-error" demonstration
+        # command, which the except below catches and records.
+        cp = run_command(context.inventory_item.name, context.command)
 
         context.value = completed_process_to_dict(cp)  # ADAPTER
         # A successful PUT (idempotent) operation mutates host state, so this is
@@ -678,6 +669,9 @@ async def execute(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
+    # Clear per-host simulated command state from any previous run so this run
+    # starts from the baseline (e.g. a package installed earlier is gone).
+    reset()
     try:
         await process_inventory(inventory, root_obj_factory, board)
         return True

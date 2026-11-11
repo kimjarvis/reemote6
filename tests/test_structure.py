@@ -550,12 +550,13 @@ async def test_shell_and_callback():
         assert resp.error is False
         assert "uname -s" in resp.value["command"]
 
-    # Callback results recorded for both hosts.
+    # Callback results recorded for both hosts.  The `uname` Callback returns
+    # the `detect-os` Shell's stdout -- now a realistic simulated `uname -s`.
     assert "uname" in board.results
     for host_name in ("host-a", "host-b"):
         resp = board.results["uname"][host_name]
         assert resp.value is not None
-        assert host_name in resp.value  # simulated stdout contains host name
+        assert resp.value == "Linux\n"  # simulated `uname -s` stdout
 
 
 @pytest.mark.asyncio
@@ -683,8 +684,12 @@ def test_demo_print_apt_changed(capsys):
     asyncio.run(execute(lambda b: demo_script(b, inventory), inventory, board))
 
     captured = capsys.readouterr()
-    assert "web-1: not changed" in captured.out
-    assert "web-2: not changed" in captured.out
+    # `apt-get install -y cowsay` really adds cowsay to each linux host's
+    # simulated package state, so the before/after `apt list --installed`
+    # listings differ and the probe reports "changed".  win-1 is group-filtered
+    # (NULL OBJECT) and stays silent.
+    assert "web-1: changed" in captured.out
+    assert "web-2: changed" in captured.out
     assert "win-1" not in captured.out
 
 
